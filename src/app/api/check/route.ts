@@ -2,11 +2,12 @@ import { NextRequest, NextResponse } from "next/server";
 import { checkAllTargets, checkTarget, findTargetById, getTargets } from "@/lib/checker";
 
 function serializeTargets() {
-  return getTargets().map(({ id, name, providerType, models }) => ({
+  return getTargets().map(({ id, name, providerType, models, status }) => ({
     id,
     name,
     providerType,
     models,
+    status,
   }));
 }
 

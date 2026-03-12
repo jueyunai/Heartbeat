@@ -9,6 +9,7 @@ export type CheckTarget = {
   providerType: ProviderType;
   baseUrl: string;
   models: string[];
+  status?: string;
   apiKey?: string;
   timeoutMs?: number;
   enabled: boolean;
@@ -90,6 +91,7 @@ type RawCheckTarget = {
   baseUrl?: string;
   model?: string;
   models?: string[];
+  status?: string;
   apiKey?: string;
   timeoutMs?: number;
   enabled?: boolean;
@@ -152,6 +154,7 @@ function normalizeJsonTarget(target: RawCheckTarget, defaults: ReturnType<typeof
     providerType: target.providerType,
     baseUrl: trimTrailingSlash(target.baseUrl),
     models,
+    status: target.status?.trim() || undefined,
     apiKey: target.apiKey || "",
     timeoutMs: toPositiveNumber(
       typeof target.timeoutMs === "number" ? String(target.timeoutMs) : undefined,

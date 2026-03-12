@@ -8,6 +8,7 @@ type TargetSummary = {
   name: string;
   providerType: ProviderType;
   models: string[];
+  status?: string;
 };
 
 type CheckApiResponse = {
@@ -38,10 +39,31 @@ type OpenPanel =
     }
   | null;
 
+type AvailableModelGroup = "claude" | "gpt" | "domestic";
+
+type EndpointGroupTab = "all" | AvailableModelGroup;
+
+type GroupedAvailableModels = Record<AvailableModelGroup, string[]>;
+
+type ModelsLoadState = "idle" | "loading" | "success" | "error";
+
 const providerLabelMap: Record<ProviderType, string> = {
   "openai-compatible": "OpenAI Compatible",
   "openai-responses": "OpenAI Responses",
   "anthropic-compatible": "Anthropic Compatible",
+};
+
+const availableModelGroupLabelMap: Record<AvailableModelGroup, string> = {
+  claude: "Claude 分组",
+  gpt: "GPT 分组",
+  domestic: "国产分组",
+};
+
+const endpointGroupTabLabelMap: Record<EndpointGroupTab, string> = {
+  all: "全部端点",
+  claude: "Claude 分组",
+  gpt: "GPT 分组",
+  domestic: "国产分组",
 };
 
 const statusLabelMap: Record<CheckResult["status"], string> = {
@@ -61,6 +83,19 @@ const statusClassMap: Record<CheckResult["status"], string> = {
   timeout: "border-rose-400/40 bg-rose-400/12 text-rose-200",
   error: "border-red-400/40 bg-red-400/12 text-red-200",
 };
+
+const targetStatusClassMap: Record<string, string> = {
+  可用: "border-emerald-400/40 bg-emerald-400/12 text-emerald-200",
+  不可用: "border-rose-400/40 bg-rose-400/12 text-rose-200",
+};
+
+function getTargetStatusClassName(status?: string) {
+  if (!status) {
+    return "";
+  }
+
+  return targetStatusClassMap[status] || "border-slate-300/20 bg-slate-300/10 text-slate-200";
+}
 
 function formatTime(value?: string) {
   if (!value) return "未检测";
@@ -86,10 +121,56 @@ function getPanelKey(type: "configured" | "available", targetId: string) {
   return `${type}:${targetId}`;
 }
 
+function getAvailableModelGroup(model: string): AvailableModelGroup {
+  const normalizedModel = model.toLowerCase();
+
+  if (normalizedModel.includes("claude")) {
+    return "claude";
+  }
+
+  if (normalizedModel.includes("gpt")) {
+    return "gpt";
+  }
+
+  return "domestic";
+}
+
+function groupAvailableModels(models: string[]): GroupedAvailableModels {
+  return models.reduce<GroupedAvailableModels>(
+    (groups, model) => {
+      groups[getAvailableModelGroup(model)].push(model);
+      return groups;
+    },
+    {
+      claude: [],
+      gpt: [],
+      domestic: [],
+    },
+  );
+}
+
+function getEndpointGroup(models: string[]): AvailableModelGroup {
+  const groupedModels = groupAvailableModels(models);
+
+  if (groupedModels.claude.length > 0) {
+    return "claude";
+  }
+
+  if (groupedModels.gpt.length > 0) {
+    return "gpt";
+  }
+
+  return "domestic";
+}
+
 export default function Home() {
   const [targets, setTargets] = useState<TargetSummary[]>([]);
   const [results, setResults] = useState<Record<string, CheckResult[]>>({});
   const [availableModels, setAvailableModels] = useState<Record<string, AvailableModelsResult>>({});
+  const [modelsLoadState, setModelsLoadState] = useState<Record<string, ModelsLoadState>>({});
+  const [modelsLoadError, setModelsLoadError] = useState<Record<string, string>>({});
+  const [activeEndpointGroupTab, setActiveEndpointGroupTab] = useState<EndpointGroupTab>("all");
+  const [availableModelTabs, setAvailableModelTabs] = useState<Record<string, AvailableModelGroup>>({});
   const [pageError, setPageError] = useState("");
   const [isCheckingAll, setIsCheckingAll] = useState(false);
   const [checkingIds, setCheckingIds] = useState<string[]>([]);
@@ -115,28 +196,30 @@ export default function Home() {
     return data;
   }
 
+  async function requestModelsForTarget(targetId: string) {
+    const response = await fetch(`/api/models?targetId=${encodeURIComponent(targetId)}`, {
+      cache: "no-store",
+    });
+
+    const data = (await response.json()) as ModelsApiResponse;
+
+    if (!response.ok || !data.ok) {
+      throw new Error(data.error?.message || "加载模型列表失败");
+    }
+
+    return data.results?.[0] || null;
+  }
+
   async function loadTargets() {
     try {
-      const [targetsResponse, modelsResponse] = await Promise.all([
-        fetch("/api/check", { cache: "no-store" }),
-        fetch("/api/models", { cache: "no-store" }),
-      ]);
-
+      const targetsResponse = await fetch("/api/check", { cache: "no-store" });
       const targetsData = (await targetsResponse.json()) as CheckApiResponse;
-      const modelsData = (await modelsResponse.json()) as ModelsApiResponse;
 
       if (!targetsResponse.ok || !targetsData.ok) {
         throw new Error(targetsData.error?.message || "加载检测目标失败");
       }
 
-      if (!modelsResponse.ok || !modelsData.ok) {
-        throw new Error(modelsData.error?.message || "加载模型列表失败");
-      }
-
       setTargets(targetsData.targets || []);
-      setAvailableModels(
-        Object.fromEntries((modelsData.results || []).map((item) => [item.targetId, item])) as Record<string, AvailableModelsResult>,
-      );
     } catch (error) {
       setPageError(error instanceof Error ? error.message : "加载页面失败");
     }
@@ -176,6 +259,16 @@ export default function Home() {
     };
   }, []);
 
+  useEffect(() => {
+    setAvailableModelTabs((current) => {
+      const next = Object.fromEntries(
+        Object.entries(current).filter(([targetId]) => targets.some((target) => target.id === targetId)),
+      ) as Record<string, AvailableModelGroup>;
+
+      return Object.keys(next).length === Object.keys(current).length ? current : next;
+    });
+  }, [targets]);
+
   async function handleCopyModel(type: "configured" | "available", targetId: string, model: string) {
     try {
       await navigator.clipboard.writeText(model);
@@ -193,6 +286,13 @@ export default function Home() {
 
       return { type, targetId };
     });
+  }
+
+  function handleAvailableModelTabChange(targetId: string, group: AvailableModelGroup) {
+    setAvailableModelTabs((current) => ({
+      ...current,
+      [targetId]: group,
+    }));
   }
 
   async function handleCheckAll() {
@@ -225,20 +325,57 @@ export default function Home() {
   async function handleCheckOne(targetId: string) {
     setPageError("");
     setCheckingIds((current) => [...current, targetId]);
+    setModelsLoadState((current) => ({
+      ...current,
+      [targetId]: "loading",
+    }));
+    setModelsLoadError((current) => {
+      const next = { ...current };
+      delete next[targetId];
+      return next;
+    });
 
-    try {
-      const data = await requestCheck("one", targetId);
+    const [checkResult, modelsResult] = await Promise.allSettled([
+      requestCheck("one", targetId),
+      requestModelsForTarget(targetId),
+    ]);
+
+    if (checkResult.status === "fulfilled") {
+      const data = checkResult.value;
       if (data.results) {
         setResults((current) => ({
           ...current,
           [targetId]: data.results || [],
         }));
       }
-    } catch (error) {
-      setPageError(error instanceof Error ? error.message : `检测 ${targetId} 失败`);
-    } finally {
-      setCheckingIds((current) => current.filter((item) => item !== targetId));
+    } else {
+      setPageError(checkResult.reason instanceof Error ? checkResult.reason.message : `检测 ${targetId} 失败`);
     }
+
+    if (modelsResult.status === "fulfilled") {
+      const modelResult = modelsResult.value;
+      if (modelResult) {
+        setAvailableModels((current) => ({
+          ...current,
+          [targetId]: modelResult,
+        }));
+      }
+      setModelsLoadState((current) => ({
+        ...current,
+        [targetId]: "success",
+      }));
+    } else {
+      setModelsLoadState((current) => ({
+        ...current,
+        [targetId]: "error",
+      }));
+      setModelsLoadError((current) => ({
+        ...current,
+        [targetId]: modelsResult.reason instanceof Error ? modelsResult.reason.message : "加载模型列表失败",
+      }));
+    }
+
+    setCheckingIds((current) => current.filter((item) => item !== targetId));
   }
 
   const summary = useMemo(() => {
@@ -258,6 +395,29 @@ export default function Home() {
       totalRetries,
     };
   }, [results, targets.length]);
+
+  const endpointCountsByGroup = useMemo(() => {
+    return targets.reduce<Record<AvailableModelGroup, number>>(
+      (counts, target) => {
+        const endpointGroup = getEndpointGroup(availableModels[target.id]?.models || target.models);
+        counts[endpointGroup] += 1;
+        return counts;
+      },
+      {
+        claude: 0,
+        gpt: 0,
+        domestic: 0,
+      },
+    );
+  }, [availableModels, targets]);
+
+  const visibleTargets = useMemo(() => {
+    if (activeEndpointGroupTab === "all") {
+      return targets;
+    }
+
+    return targets.filter((target) => getEndpointGroup(availableModels[target.id]?.models || target.models) === activeEndpointGroupTab);
+  }, [activeEndpointGroupTab, availableModels, targets]);
 
   return (
     <main className="min-h-screen bg-[#07111f] text-[#edf4ff]">
@@ -317,19 +477,50 @@ export default function Home() {
         </section>
 
         <section className="mt-6 rounded-[28px] border border-white/10 bg-[#091423]/92 p-4 shadow-[0_24px_80px_rgba(0,0,0,0.35)] sm:p-5" ref={panelContainerRef}>
-          <div className="space-y-4">
-            {targets.map((target) => {
-              const targetResults = results[target.id] || [];
-              const modelsResult = availableModels[target.id];
-              const isChecking = checkingIds.includes(target.id);
-              const configuredModelsText = summarizeModels(target.models);
-              const availableModelsText = modelsResult?.models?.length
-                ? summarizeModels(modelsResult.models, 3)
-                : modelsResult?.message || "等待加载";
-              const configuredPanelOpen = openPanel?.type === "configured" && openPanel.targetId === target.id;
-              const availablePanelOpen = openPanel?.type === "available" && openPanel.targetId === target.id;
+          <div className="mb-4 flex flex-wrap gap-2 border-b border-white/8 pb-4">
+            {(Object.keys(endpointGroupTabLabelMap) as EndpointGroupTab[]).map((group) => {
+              const isActive = activeEndpointGroupTab === group;
+              const count = group === "all" ? targets.length : endpointCountsByGroup[group];
 
               return (
+                <button
+                  key={group}
+                  type="button"
+                  onClick={() => setActiveEndpointGroupTab(group)}
+                  className={`rounded-full border px-4 py-2 text-sm transition ${
+                    isActive
+                      ? "border-cyan-300/50 bg-cyan-300/15 text-cyan-100"
+                      : "border-white/10 bg-white/5 text-slate-300 hover:border-white/20 hover:bg-white/10"
+                  }`}
+                >
+                  {endpointGroupTabLabelMap[group]} ({count})
+                </button>
+              );
+            })}
+          </div>
+          <div className="space-y-4">
+            {visibleTargets.length > 0 ? (
+              visibleTargets.map((target) => {
+                const targetResults = results[target.id] || [];
+                const modelsResult = availableModels[target.id];
+                const modelsState = modelsLoadState[target.id] || "idle";
+                const modelsError = modelsLoadError[target.id];
+                const availableModelGroups = groupAvailableModels(modelsResult?.models || []);
+                const activeAvailableModelTab = availableModelTabs[target.id] || "claude";
+                const activeAvailableModels = availableModelGroups[activeAvailableModelTab];
+                const isChecking = checkingIds.includes(target.id);
+                const configuredModelsText = summarizeModels(target.models);
+                const availableModelsText = modelsResult?.models?.length
+                  ? summarizeModels(modelsResult.models, 3)
+                  : modelsState === "loading"
+                    ? "加载中..."
+                    : modelsState === "error"
+                      ? modelsError || modelsResult?.message || "加载模型列表失败"
+                      : modelsResult?.message || "点击检测端点后加载";
+                const configuredPanelOpen = openPanel?.type === "configured" && openPanel.targetId === target.id;
+                const availablePanelOpen = openPanel?.type === "available" && openPanel.targetId === target.id;
+
+                return (
                 <div
                   key={target.id}
                   className="rounded-[24px] border border-white/8 bg-black/10 px-5 py-5 backdrop-blur-sm"
@@ -341,6 +532,11 @@ export default function Home() {
                         <span className="inline-flex rounded-full border border-cyan-300/20 bg-cyan-300/10 px-3 py-1 text-xs text-cyan-100">
                           {providerLabelMap[target.providerType]}
                         </span>
+                        {target.status ? (
+                          <span className={`inline-flex rounded-full border px-3 py-1 text-xs ${getTargetStatusClassName(target.status)}`}>
+                            {target.status}
+                          </span>
+                        ) : null}
                       </div>
 
                       <div className="grid gap-3 text-sm text-slate-300 md:grid-cols-2">
@@ -420,24 +616,51 @@ export default function Home() {
                                   </button>
                                 </div>
                                 <div className="mb-3 text-xs text-slate-500">点击模型名称即可复制，共 {modelsResult.models.length} 个</div>
-                                <div className="max-h-80 overflow-auto pr-1">
-                                  <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
-                                    {modelsResult.models.map((model) => {
-                                      const copyKey = `${getPanelKey("available", target.id)}:${model}`;
-                                      const copied = copiedModelKey === copyKey;
+                                <div className="mb-3 flex flex-wrap gap-2">
+                                  {(Object.keys(availableModelGroupLabelMap) as AvailableModelGroup[]).map((group) => {
+                                    const isActive = activeAvailableModelTab === group;
+                                    const count = availableModelGroups[group].length;
 
-                                      return (
-                                        <button
-                                          key={model}
-                                          type="button"
-                                          onClick={() => handleCopyModel("available", target.id, model)}
-                                          className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-left text-xs text-slate-100 transition hover:border-cyan-300/40 hover:bg-cyan-300/10"
-                                        >
-                                          {copied ? `已复制：${model}` : model}
-                                        </button>
-                                      );
-                                    })}
-                                  </div>
+                                    return (
+                                      <button
+                                        key={group}
+                                        type="button"
+                                        onClick={() => handleAvailableModelTabChange(target.id, group)}
+                                        className={`rounded-full border px-3 py-1 text-xs transition ${
+                                          isActive
+                                            ? "border-cyan-300/50 bg-cyan-300/15 text-cyan-100"
+                                            : "border-white/10 bg-white/5 text-slate-300 hover:border-white/20 hover:bg-white/10"
+                                        }`}
+                                      >
+                                        {availableModelGroupLabelMap[group]} ({count})
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                                <div className="max-h-80 overflow-auto pr-1">
+                                  {activeAvailableModels.length > 0 ? (
+                                    <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                                      {activeAvailableModels.map((model) => {
+                                        const copyKey = `${getPanelKey("available", target.id)}:${model}`;
+                                        const copied = copiedModelKey === copyKey;
+
+                                        return (
+                                          <button
+                                            key={model}
+                                            type="button"
+                                            onClick={() => handleCopyModel("available", target.id, model)}
+                                            className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-left text-xs text-slate-100 transition hover:border-cyan-300/40 hover:bg-cyan-300/10"
+                                          >
+                                            {copied ? `已复制：${model}` : model}
+                                          </button>
+                                        );
+                                      })}
+                                    </div>
+                                  ) : (
+                                    <div className="rounded-2xl border border-dashed border-white/10 bg-white/[0.03] px-4 py-6 text-center text-sm text-slate-400">
+                                      该分组暂无模型
+                                    </div>
+                                  )}
                                 </div>
                               </div>
                             ) : null}
@@ -500,7 +723,12 @@ export default function Home() {
                   </div>
                 </div>
               );
-            })}
+            })
+            ) : (
+              <div className="rounded-[24px] border border-dashed border-white/10 bg-white/[0.03] px-5 py-10 text-center text-sm text-slate-400">
+                当前分组下暂无端点
+              </div>
+            )}
           </div>
 
           {pageError ? (
