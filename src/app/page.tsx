@@ -1,16 +1,16 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import type { CheckResult, ProviderType } from "@/lib/checker";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { AvailableModelsResult, CheckResult, ProviderType } from "@/lib/checker";
 
 type TargetSummary = {
   id: string;
   name: string;
   providerType: ProviderType;
-  model: string;
+  models: string[];
 };
 
-type ApiResponse = {
+type CheckApiResponse = {
   ok: boolean;
   timestamp?: string;
   targets?: TargetSummary[];
@@ -21,8 +21,26 @@ type ApiResponse = {
   };
 };
 
+type ModelsApiResponse = {
+  ok: boolean;
+  timestamp?: string;
+  results?: AvailableModelsResult[];
+  error?: {
+    code: string;
+    message: string;
+  };
+};
+
+type OpenPanel =
+  | {
+      type: "configured" | "available";
+      targetId: string;
+    }
+  | null;
+
 const providerLabelMap: Record<ProviderType, string> = {
   "openai-compatible": "OpenAI Compatible",
+  "openai-responses": "OpenAI Responses",
   "anthropic-compatible": "Anthropic Compatible",
 };
 
@@ -56,12 +74,28 @@ function formatTime(value?: string) {
   }).format(new Date(value));
 }
 
+function summarizeModels(models: string[], limit = 2) {
+  if (models.length <= limit) {
+    return models.join("、");
+  }
+
+  return `${models.slice(0, limit).join("、")} 等 ${models.length} 个`;
+}
+
+function getPanelKey(type: "configured" | "available", targetId: string) {
+  return `${type}:${targetId}`;
+}
+
 export default function Home() {
   const [targets, setTargets] = useState<TargetSummary[]>([]);
-  const [results, setResults] = useState<Record<string, CheckResult>>({});
+  const [results, setResults] = useState<Record<string, CheckResult[]>>({});
+  const [availableModels, setAvailableModels] = useState<Record<string, AvailableModelsResult>>({});
   const [pageError, setPageError] = useState("");
   const [isCheckingAll, setIsCheckingAll] = useState(false);
   const [checkingIds, setCheckingIds] = useState<string[]>([]);
+  const [openPanel, setOpenPanel] = useState<OpenPanel>(null);
+  const [copiedModelKey, setCopiedModelKey] = useState("");
+  const panelContainerRef = useRef<HTMLDivElement | null>(null);
 
   async function requestCheck(mode: "all" | "one", targetId?: string) {
     const response = await fetch("/api/check", {
@@ -72,7 +106,7 @@ export default function Home() {
       body: JSON.stringify({ mode, targetId }),
     });
 
-    const data = (await response.json()) as ApiResponse;
+    const data = (await response.json()) as CheckApiResponse;
 
     if (!response.ok || !data.ok) {
       throw new Error(data.error?.message || "请求失败");
@@ -83,14 +117,26 @@ export default function Home() {
 
   async function loadTargets() {
     try {
-      const response = await fetch("/api/check", { cache: "no-store" });
-      const data = (await response.json()) as ApiResponse;
+      const [targetsResponse, modelsResponse] = await Promise.all([
+        fetch("/api/check", { cache: "no-store" }),
+        fetch("/api/models", { cache: "no-store" }),
+      ]);
 
-      if (!response.ok || !data.ok) {
-        throw new Error(data.error?.message || "加载检测目标失败");
+      const targetsData = (await targetsResponse.json()) as CheckApiResponse;
+      const modelsData = (await modelsResponse.json()) as ModelsApiResponse;
+
+      if (!targetsResponse.ok || !targetsData.ok) {
+        throw new Error(targetsData.error?.message || "加载检测目标失败");
       }
 
-      setTargets(data.targets || []);
+      if (!modelsResponse.ok || !modelsData.ok) {
+        throw new Error(modelsData.error?.message || "加载模型列表失败");
+      }
+
+      setTargets(targetsData.targets || []);
+      setAvailableModels(
+        Object.fromEntries((modelsData.results || []).map((item) => [item.targetId, item])) as Record<string, AvailableModelsResult>,
+      );
     } catch (error) {
       setPageError(error instanceof Error ? error.message : "加载页面失败");
     }
@@ -100,6 +146,55 @@ export default function Home() {
     void loadTargets();
   }, []);
 
+  useEffect(() => {
+    if (!copiedModelKey) {
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      setCopiedModelKey("");
+    }, 1600);
+
+    return () => window.clearTimeout(timeout);
+  }, [copiedModelKey]);
+
+  useEffect(() => {
+    function handlePointerDown(event: MouseEvent) {
+      if (!panelContainerRef.current) {
+        return;
+      }
+
+      const target = event.target;
+      if (target instanceof Node && !panelContainerRef.current.contains(target)) {
+        setOpenPanel(null);
+      }
+    }
+
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+    };
+  }, []);
+
+  async function handleCopyModel(type: "configured" | "available", targetId: string, model: string) {
+    try {
+      await navigator.clipboard.writeText(model);
+      setCopiedModelKey(`${getPanelKey(type, targetId)}:${model}`);
+    } catch {
+      setPageError("复制失败，请检查浏览器是否允许访问剪贴板");
+    }
+  }
+
+  function togglePanel(type: "configured" | "available", targetId: string) {
+    setOpenPanel((current) => {
+      if (current?.type === type && current.targetId === targetId) {
+        return null;
+      }
+
+      return { type, targetId };
+    });
+  }
+
   async function handleCheckAll() {
     setPageError("");
     setIsCheckingAll(true);
@@ -108,11 +203,17 @@ export default function Home() {
       const data = await requestCheck("all");
       setTargets(data.targets || []);
       setResults((current) => {
-        const next = { ...current };
-        for (const item of data.results || []) {
-          next[item.targetId] = item;
+        const grouped = { ...current };
+        for (const target of data.targets || []) {
+          grouped[target.id] = [];
         }
-        return next;
+        for (const item of data.results || []) {
+          if (!grouped[item.targetId]) {
+            grouped[item.targetId] = [];
+          }
+          grouped[item.targetId].push(item);
+        }
+        return grouped;
       });
     } catch (error) {
       setPageError(error instanceof Error ? error.message : "检测全部失败");
@@ -127,12 +228,10 @@ export default function Home() {
 
     try {
       const data = await requestCheck("one", targetId);
-      const result = data.results?.[0];
-
-      if (result) {
+      if (data.results) {
         setResults((current) => ({
           ...current,
-          [targetId]: result,
+          [targetId]: data.results || [],
         }));
       }
     } catch (error) {
@@ -143,7 +242,7 @@ export default function Home() {
   }
 
   const summary = useMemo(() => {
-    const items = Object.values(results);
+    const items = Object.values(results).flat();
     const successCount = items.filter((item) => item.success).length;
     const avgLatency = items.length
       ? Math.round(items.reduce((total, item) => total + item.latencyMs, 0) / items.length)
@@ -174,7 +273,7 @@ export default function Home() {
                 <div className="space-y-3">
                   <h1 className="font-serif text-4xl leading-tight text-white sm:text-5xl">
                     点击一次，刷新一次。
-                    <span className="block text-cyan-200/90">只保留最必要的大模型 API 健康信号。</span>
+                    <span className="block text-cyan-200/90">端点内多个模型会并行检测，并展示上游可用模型列表。</span>
                   </h1>
                   <p className="max-w-2xl text-sm leading-7 text-slate-300 sm:text-base">
                     这是一个偏轻量的心跳检测首页：不做持续轮询、不做复杂历史，只在你点击时发起一次真实探测，并把状态、耗时和错误摘要清晰展示出来。
@@ -192,16 +291,16 @@ export default function Home() {
                   {isCheckingAll ? "检测进行中..." : "检测全部"}
                 </button>
                 <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-300">
-                  已加载 {summary.total} 个目标，已检测 {summary.checked} 个
+                  已加载 {summary.total} 个端点，已检测 {summary.checked} 个模型
                 </div>
               </div>
             </div>
 
             <div className="grid gap-4 md:grid-cols-5">
               {[
-                { label: "检测目标", value: String(summary.total), tone: "text-cyan-100" },
-                { label: "成功数", value: String(summary.successCount), tone: "text-emerald-200" },
-                { label: "失败数", value: String(summary.failureCount), tone: "text-rose-200" },
+                { label: "检测端点", value: String(summary.total), tone: "text-cyan-100" },
+                { label: "成功模型", value: String(summary.successCount), tone: "text-emerald-200" },
+                { label: "失败模型", value: String(summary.failureCount), tone: "text-rose-200" },
                 { label: "平均耗时", value: summary.avgLatency ? `${summary.avgLatency} ms` : "--", tone: "text-amber-200" },
                 { label: "重试次数", value: String(summary.totalRetries), tone: "text-purple-200" },
               ].map((item) => (
@@ -217,59 +316,134 @@ export default function Home() {
           </div>
         </section>
 
-        <section className="mt-6 rounded-[28px] border border-white/10 bg-[#091423]/92 p-4 shadow-[0_24px_80px_rgba(0,0,0,0.35)] sm:p-5">
-          <div className="overflow-hidden rounded-[22px] border border-white/8 bg-black/10">
-            <div className="grid grid-cols-[1.5fr_1fr_1fr_1fr_1.3fr_1.1fr] gap-4 border-b border-white/8 px-5 py-4 text-xs uppercase tracking-[0.24em] text-slate-400">
-              <div>目标</div>
-              <div>协议</div>
-              <div>状态</div>
-              <div>耗时</div>
-              <div>最后结果</div>
-              <div className="text-right">操作</div>
-            </div>
+        <section className="mt-6 rounded-[28px] border border-white/10 bg-[#091423]/92 p-4 shadow-[0_24px_80px_rgba(0,0,0,0.35)] sm:p-5" ref={panelContainerRef}>
+          <div className="space-y-4">
+            {targets.map((target) => {
+              const targetResults = results[target.id] || [];
+              const modelsResult = availableModels[target.id];
+              const isChecking = checkingIds.includes(target.id);
+              const configuredModelsText = summarizeModels(target.models);
+              const availableModelsText = modelsResult?.models?.length
+                ? summarizeModels(modelsResult.models, 3)
+                : modelsResult?.message || "等待加载";
+              const configuredPanelOpen = openPanel?.type === "configured" && openPanel.targetId === target.id;
+              const availablePanelOpen = openPanel?.type === "available" && openPanel.targetId === target.id;
 
-            <div className="divide-y divide-white/6">
-              {targets.map((target) => {
-                const result = results[target.id];
-                const isChecking = checkingIds.includes(target.id);
-                return (
-                  <div
-                    key={target.id}
-                    className="grid grid-cols-1 gap-4 px-5 py-5 md:grid-cols-[1.5fr_1fr_1fr_1fr_1.3fr_1.1fr] md:items-center"
-                  >
-                    <div className="space-y-2">
-                      <div className="text-lg font-medium text-white">{target.name}</div>
-                      <div className="text-sm text-slate-400">{target.model}</div>
-                    </div>
-
-                    <div>
-                      <span className="inline-flex rounded-full border border-cyan-300/20 bg-cyan-300/10 px-3 py-1 text-xs text-cyan-100">
-                        {providerLabelMap[target.providerType]}
-                      </span>
-                    </div>
-
-                    <div>
-                      {result ? (
-                        <span
-                          className={`inline-flex rounded-full border px-3 py-1 text-xs ${statusClassMap[result.status]}`}
-                        >
-                          {statusLabelMap[result.status]}
+              return (
+                <div
+                  key={target.id}
+                  className="rounded-[24px] border border-white/8 bg-black/10 px-5 py-5 backdrop-blur-sm"
+                >
+                  <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                    <div className="min-w-0 flex-1 space-y-3">
+                      <div className="flex flex-wrap items-center gap-3">
+                        <div className="text-lg font-medium text-white">{target.name}</div>
+                        <span className="inline-flex rounded-full border border-cyan-300/20 bg-cyan-300/10 px-3 py-1 text-xs text-cyan-100">
+                          {providerLabelMap[target.providerType]}
                         </span>
-                      ) : (
-                        <span className="inline-flex rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-slate-400">
-                          未检测
-                        </span>
-                      )}
-                    </div>
+                      </div>
 
-                    <div className="text-sm text-slate-200">{result ? `${result.latencyMs} ms` : "--"}</div>
+                      <div className="grid gap-3 text-sm text-slate-300 md:grid-cols-2">
+                        <div className="space-y-1">
+                          <div className="text-xs uppercase tracking-[0.2em] text-slate-500">已配模型</div>
+                          <div className="relative max-w-full">
+                            <button
+                              type="button"
+                              onClick={() => togglePanel("configured", target.id)}
+                              className="flex w-full items-center justify-between gap-3 rounded-2xl border border-white/8 bg-white/5 px-3 py-2 text-left transition hover:bg-white/10"
+                            >
+                              <span className="truncate text-slate-200">{configuredModelsText}</span>
+                              {target.models.length > 2 ? (
+                                <span className="shrink-0 text-xs text-cyan-200">{configuredPanelOpen ? "收起" : "展开"}</span>
+                              ) : null}
+                            </button>
+                            {target.models.length > 2 && configuredPanelOpen ? (
+                              <div className="absolute bottom-full left-0 z-30 mb-2 w-[min(42rem,calc(100vw-4rem))] rounded-2xl border border-white/10 bg-[#0d1b2d] px-4 py-3 text-sm text-slate-100 shadow-2xl">
+                                <div className="mb-2 flex items-center justify-between gap-3">
+                                  <div className="text-xs uppercase tracking-[0.2em] text-slate-400">全部已配模型</div>
+                                  <button
+                                    type="button"
+                                    onClick={() => setOpenPanel(null)}
+                                    className="text-xs text-slate-400 transition hover:text-white"
+                                  >
+                                    关闭
+                                  </button>
+                                </div>
+                                <div className="mb-3 text-xs text-slate-500">点击模型名称即可复制，共 {target.models.length} 个</div>
+                                <div className="max-h-72 overflow-auto pr-1">
+                                  <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                                    {target.models.map((model) => {
+                                      const copyKey = `${getPanelKey("configured", target.id)}:${model}`;
+                                      const copied = copiedModelKey === copyKey;
 
-                    <div className="space-y-1 text-sm">
-                      <div className="text-slate-200">{result?.message || "等待首次检测"}</div>
-                      <div className="text-slate-500">{formatTime(result?.checkedAt)}</div>
-                      {result && result.retries > 0 && (
-                        <div className="text-xs text-amber-400">重试 {result.retries} 次</div>
-                      )}
+                                      return (
+                                        <button
+                                          key={model}
+                                          type="button"
+                                          onClick={() => handleCopyModel("configured", target.id, model)}
+                                          className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-left text-xs text-slate-100 transition hover:border-cyan-300/40 hover:bg-cyan-300/10"
+                                        >
+                                          {copied ? `已复制：${model}` : model}
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              </div>
+                            ) : null}
+                          </div>
+                        </div>
+
+                        <div className="space-y-1">
+                          <div className="text-xs uppercase tracking-[0.2em] text-slate-500">上游可用模型</div>
+                          <div className="relative max-w-full">
+                            <button
+                              type="button"
+                              onClick={() => togglePanel("available", target.id)}
+                              className="flex w-full items-center justify-between gap-3 rounded-2xl border border-white/8 bg-white/5 px-3 py-2 text-left transition hover:bg-white/10"
+                            >
+                              <span className="truncate text-slate-200">{availableModelsText}</span>
+                              {modelsResult?.models && modelsResult.models.length > 3 ? (
+                                <span className="shrink-0 text-xs text-cyan-200">{availablePanelOpen ? "收起" : "展开"}</span>
+                              ) : null}
+                            </button>
+                            {modelsResult?.models && modelsResult.models.length > 3 && availablePanelOpen ? (
+                              <div className="absolute bottom-full right-0 z-30 mb-2 w-[min(56rem,calc(100vw-4rem))] rounded-2xl border border-white/10 bg-[#0d1b2d] px-4 py-3 text-sm text-slate-100 shadow-2xl">
+                                <div className="mb-2 flex items-center justify-between gap-3">
+                                  <div className="text-xs uppercase tracking-[0.2em] text-slate-400">全部可用模型</div>
+                                  <button
+                                    type="button"
+                                    onClick={() => setOpenPanel(null)}
+                                    className="text-xs text-slate-400 transition hover:text-white"
+                                  >
+                                    关闭
+                                  </button>
+                                </div>
+                                <div className="mb-3 text-xs text-slate-500">点击模型名称即可复制，共 {modelsResult.models.length} 个</div>
+                                <div className="max-h-80 overflow-auto pr-1">
+                                  <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                                    {modelsResult.models.map((model) => {
+                                      const copyKey = `${getPanelKey("available", target.id)}:${model}`;
+                                      const copied = copiedModelKey === copyKey;
+
+                                      return (
+                                        <button
+                                          key={model}
+                                          type="button"
+                                          onClick={() => handleCopyModel("available", target.id, model)}
+                                          className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-left text-xs text-slate-100 transition hover:border-cyan-300/40 hover:bg-cyan-300/10"
+                                        >
+                                          {copied ? `已复制：${model}` : model}
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              </div>
+                            ) : null}
+                          </div>
+                        </div>
+                      </div>
                     </div>
 
                     <div className="flex items-center justify-end">
@@ -279,13 +453,54 @@ export default function Home() {
                         disabled={isChecking}
                         className="inline-flex h-11 items-center justify-center rounded-full border border-white/12 bg-white/8 px-5 text-sm text-slate-100 transition hover:bg-white/14 disabled:cursor-not-allowed disabled:opacity-50"
                       >
-                        {isChecking ? "检测中..." : "检测"}
+                        {isChecking ? "检测中..." : "检测端点"}
                       </button>
                     </div>
                   </div>
-                );
-              })}
-            </div>
+
+                  <div className="mt-4 overflow-hidden rounded-[20px] border border-white/8 bg-white/[0.02]">
+                    <div className="grid grid-cols-[1.3fr_0.8fr_0.8fr_1.6fr] gap-4 border-b border-white/8 px-4 py-3 text-xs uppercase tracking-[0.22em] text-slate-500">
+                      <div>模型</div>
+                      <div>状态</div>
+                      <div>耗时</div>
+                      <div>最后结果</div>
+                    </div>
+                    <div className="divide-y divide-white/6">
+                      {target.models.map((model) => {
+                        const result = targetResults.find((item) => item.model === model);
+                        return (
+                          <div
+                            key={`${target.id}-${model}`}
+                            className="grid grid-cols-1 gap-3 px-4 py-4 md:grid-cols-[1.3fr_0.8fr_0.8fr_1.6fr] md:items-center"
+                          >
+                            <div className="text-sm text-slate-200">{model}</div>
+                            <div>
+                              {result ? (
+                                <span className={`inline-flex rounded-full border px-3 py-1 text-xs ${statusClassMap[result.status]}`}>
+                                  {statusLabelMap[result.status]}
+                                </span>
+                              ) : (
+                                <span className="inline-flex rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-slate-400">
+                                  未检测
+                                </span>
+                              )}
+                            </div>
+                            <div className="text-sm text-slate-200">{result ? `${result.latencyMs} ms` : "--"}</div>
+                            <div className="space-y-1 text-sm">
+                              <div className="text-slate-200">{result?.message || "等待首次检测"}</div>
+                              <div className="text-slate-500">{formatTime(result?.checkedAt)}</div>
+                              {result && result.retries > 0 ? (
+                                <div className="text-xs text-amber-400">重试 {result.retries} 次</div>
+                              ) : null}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
           </div>
 
           {pageError ? (

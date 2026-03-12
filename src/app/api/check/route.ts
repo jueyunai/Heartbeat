@@ -1,6 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
 import { checkAllTargets, checkTarget, findTargetById, getTargets } from "@/lib/checker";
 
+function serializeTargets() {
+  return getTargets().map(({ id, name, providerType, models }) => ({
+    id,
+    name,
+    providerType,
+    models,
+  }));
+}
+
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
@@ -49,17 +58,12 @@ export async function POST(request: NextRequest) {
         );
       }
 
-      const result = await checkTarget(target);
+      const results = await checkTarget(target);
       return NextResponse.json({
         ok: true,
         timestamp: new Date().toISOString(),
-        targets: getTargets().map(({ id, name, providerType, model }) => ({
-          id,
-          name,
-          providerType,
-          model,
-        })),
-        results: [result],
+        targets: serializeTargets(),
+        results,
       });
     }
 
@@ -67,12 +71,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({
       ok: true,
       timestamp: new Date().toISOString(),
-      targets: getTargets().map(({ id, name, providerType, model }) => ({
-        id,
-        name,
-        providerType,
-        model,
-      })),
+      targets: serializeTargets(),
       results,
     });
   } catch {
@@ -93,11 +92,6 @@ export async function GET() {
   return NextResponse.json({
     ok: true,
     timestamp: new Date().toISOString(),
-    targets: getTargets().map(({ id, name, providerType, model }) => ({
-      id,
-      name,
-      providerType,
-      model,
-    })),
+    targets: serializeTargets(),
   });
 }

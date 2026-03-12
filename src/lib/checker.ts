@@ -1,14 +1,14 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
-export type ProviderType = "openai-compatible" | "anthropic-compatible";
+export type ProviderType = "openai-compatible" | "openai-responses" | "anthropic-compatible";
 
 export type CheckTarget = {
   id: string;
   name: string;
   providerType: ProviderType;
   baseUrl: string;
-  model: string;
+  models: string[];
   apiKey?: string;
   timeoutMs?: number;
   enabled: boolean;
@@ -23,21 +23,34 @@ export type CheckResult = {
   targetId: string;
   targetName: string;
   providerType: ProviderType;
+  model: string;
   success: boolean;
   status: CheckStatus;
   latencyMs: number;
   statusCode: number | null;
   message: string;
   checkedAt: string;
-  retries: number; // 新增：实际重试次数
+  retries: number;
 };
 
-// 默认配置常量
+export type AvailableModelsResult = {
+  targetId: string;
+  targetName: string;
+  providerType: ProviderType;
+  success: boolean;
+  status: CheckStatus;
+  statusCode: number | null;
+  message: string;
+  checkedAt: string;
+  models: string[];
+};
+
 const DEFAULT_TIMEOUT_MS = 8000;
 const DEFAULT_MAX_RETRIES = 0;
 const DEFAULT_DEGRADED_THRESHOLD_MS = 4000;
 const DEFAULT_CHECK_PROMPT = "ping";
 const ANTHROPIC_VERSION = "2023-06-01";
+const CONFIG_FILE_PATH = path.join(process.cwd(), "config", "targets.json");
 
 function trimTrailingSlash(value: string) {
   return value.replace(/\/$/, "");
@@ -70,14 +83,13 @@ const providerEnvConfigs: ProviderEnvConfig[] = [
   },
 ];
 
-const CONFIG_FILE_PATH = path.join(process.cwd(), "config", "targets.json");
-
 type RawCheckTarget = {
   id?: string;
   name?: string;
   providerType?: ProviderType;
   baseUrl?: string;
   model?: string;
+  models?: string[];
   apiKey?: string;
   timeoutMs?: number;
   enabled?: boolean;
@@ -100,7 +112,12 @@ type RawCheckerConfig = {
 };
 
 function isProviderType(value: unknown): value is ProviderType {
-  return value === "openai-compatible" || value === "anthropic-compatible";
+  return value === "openai-compatible" || value === "openai-responses" || value === "anthropic-compatible";
+}
+
+function normalizeModels(models?: string[], model?: string) {
+  const values = Array.isArray(models) ? models : model ? [model] : [];
+  return values.map((item) => item.trim()).filter(Boolean);
 }
 
 function normalizeJsonDefaults(defaults?: RawCheckerDefaults) {
@@ -123,7 +140,9 @@ function normalizeJsonDefaults(defaults?: RawCheckerDefaults) {
 }
 
 function normalizeJsonTarget(target: RawCheckTarget, defaults: ReturnType<typeof normalizeJsonDefaults>): CheckTarget | null {
-  if (!target.id || !target.name || !isProviderType(target.providerType) || !target.baseUrl || !target.model) {
+  const models = normalizeModels(target.models, target.model);
+
+  if (!target.id || !target.name || !isProviderType(target.providerType) || !target.baseUrl || models.length === 0) {
     return null;
   }
 
@@ -132,7 +151,7 @@ function normalizeJsonTarget(target: RawCheckTarget, defaults: ReturnType<typeof
     name: target.name,
     providerType: target.providerType,
     baseUrl: trimTrailingSlash(target.baseUrl),
-    model: target.model,
+    models,
     apiKey: target.apiKey || "",
     timeoutMs: toPositiveNumber(
       typeof target.timeoutMs === "number" ? String(target.timeoutMs) : undefined,
@@ -175,7 +194,9 @@ function readTargetsFromJsonConfig(): CheckTarget[] {
 
 function collectProviderIndices(prefix: ProviderEnvConfig["prefix"]) {
   const indices = new Set<number>();
-  const pattern = new RegExp(`^${prefix}_(\\d+)_(BASE_URL|MODEL|NAME|API_KEY|TIMEOUT_MS|MAX_RETRIES|DEGRADED_THRESHOLD_MS|CHECK_PROMPT)$`);
+  const pattern = new RegExp(
+    `^${prefix}_(\\d+)_(BASE_URL|MODEL|MODELS|NAME|API_KEY|TIMEOUT_MS|MAX_RETRIES|DEGRADED_THRESHOLD_MS|CHECK_PROMPT)$`,
+  );
 
   for (const key of Object.keys(process.env)) {
     const match = key.match(pattern);
@@ -187,12 +208,23 @@ function collectProviderIndices(prefix: ProviderEnvConfig["prefix"]) {
   return [...indices].sort((a, b) => a - b);
 }
 
+function normalizeEnvModels(value?: string) {
+  if (!value) return [];
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 function buildTargetFromIndexedEnv(config: ProviderEnvConfig, index: number): CheckTarget | null {
   const prefix = `${config.prefix}_${index}_`;
   const baseUrl = process.env[`${prefix}BASE_URL`];
-  const model = process.env[`${prefix}MODEL`];
+  const models = normalizeModels(
+    normalizeEnvModels(process.env[`${prefix}MODELS`]),
+    process.env[`${prefix}MODEL`],
+  );
 
-  if (!baseUrl || !model) {
+  if (!baseUrl || models.length === 0) {
     return null;
   }
 
@@ -201,7 +233,7 @@ function buildTargetFromIndexedEnv(config: ProviderEnvConfig, index: number): Ch
     name: process.env[`${prefix}NAME`] || `${config.defaultName} ${index}`,
     providerType: config.providerType,
     baseUrl: trimTrailingSlash(baseUrl),
-    model,
+    models,
     apiKey: process.env[`${prefix}API_KEY`] || process.env[config.defaultApiKeyEnv] || "",
     timeoutMs: toPositiveNumber(process.env[`${prefix}TIMEOUT_MS`], DEFAULT_TIMEOUT_MS),
     enabled: true,
@@ -216,9 +248,12 @@ function buildTargetFromIndexedEnv(config: ProviderEnvConfig, index: number): Ch
 
 function buildLegacyTarget(config: ProviderEnvConfig): CheckTarget | null {
   const baseUrl = process.env[`${config.prefix}_BASE_URL`];
-  const model = process.env[`${config.prefix}_MODEL`];
+  const models = normalizeModels(
+    normalizeEnvModels(process.env[`${config.prefix}_MODELS`]),
+    process.env[`${config.prefix}_MODEL`],
+  );
 
-  if (!baseUrl || !model) {
+  if (!baseUrl || models.length === 0) {
     return null;
   }
 
@@ -227,7 +262,7 @@ function buildLegacyTarget(config: ProviderEnvConfig): CheckTarget | null {
     name: process.env[`${config.prefix}_NAME`] || config.defaultName,
     providerType: config.providerType,
     baseUrl: trimTrailingSlash(baseUrl),
-    model,
+    models,
     apiKey: process.env[`${config.prefix}_API_KEY`] || "",
     timeoutMs: toPositiveNumber(process.env[`${config.prefix}_TIMEOUT_MS`], DEFAULT_TIMEOUT_MS),
     enabled: true,
@@ -271,7 +306,7 @@ function buildTargets(): CheckTarget[] {
         name: "演示 OpenAI",
         providerType: "openai-compatible",
         baseUrl: "https://demo.invalid/v1",
-        model: "gpt-demo-mini",
+        models: ["gpt-demo-mini", "gpt-demo-nano"],
         timeoutMs: DEFAULT_TIMEOUT_MS,
         enabled: true,
         maxRetries: DEFAULT_MAX_RETRIES,
@@ -283,7 +318,7 @@ function buildTargets(): CheckTarget[] {
         name: "演示 Anthropic",
         providerType: "anthropic-compatible",
         baseUrl: "https://demo.invalid",
-        model: "claude-demo-mini",
+        models: ["claude-demo-mini"],
         timeoutMs: DEFAULT_TIMEOUT_MS,
         enabled: true,
         maxRetries: DEFAULT_MAX_RETRIES,
@@ -305,6 +340,8 @@ function sanitizeMessage(message: string) {
     .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "Bearer ***")
     .replace(/("x-api-key"\s*:\s*")[^"]+("?)/gi, "$1***$2")
     .replace(/("api[_-]?key"\s*:\s*")[^"]+("?)/gi, "$1***$2")
+    .replace(/<!DOCTYPE html>[\s\S]*?<title>Just a moment[\s\S]*?<\/html>/i, "上游返回了网页拦截页，疑似被 Cloudflare 或网关拦截")
+    .replace(/<!DOCTYPE html>[\s\S]*?<html[\s\S]*?<\/html>/i, "上游返回了 HTML 页面，疑似请求到了网页而不是 API 接口")
     .slice(0, 240);
 }
 
@@ -327,9 +364,7 @@ async function parseErrorMessage(response: Response) {
   }
 }
 
-// 判断是否需要重试
 function shouldRetry(statusCode: number | null, timedOut: boolean): boolean {
-  // 超时、服务器错误（5xx）、限流（429）需要重试
   if (timedOut) return true;
   if (statusCode === null) return true;
   if (statusCode >= 500) return true;
@@ -337,27 +372,54 @@ function shouldRetry(statusCode: number | null, timedOut: boolean): boolean {
   return false;
 }
 
-// 计算退避延迟（指数退避 + 抖动）
 function getRetryDelay(attempt: number): number {
-  const baseDelay = Math.min(1000 * Math.pow(2, attempt), 10000); // 最大10秒
-  const jitter = Math.random() * 500; // 0-500ms 随机抖动
+  const baseDelay = Math.min(1000 * Math.pow(2, attempt), 10000);
+  const jitter = Math.random() * 500;
   return baseDelay + jitter;
 }
 
-async function checkOpenAICompatibleOnce(target: CheckTarget): Promise<CheckResult> {
+function createOpenAIHeaders(apiKey?: string) {
+  return {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${apiKey || ""}`,
+  };
+}
+
+function buildUrl(baseUrl: string, path: string) {
+  const normalizedBaseUrl = trimTrailingSlash(baseUrl);
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  return `${normalizedBaseUrl}${normalizedPath}`;
+}
+
+function getOpenAIModelsPath(target: CheckTarget) {
+  return target.baseUrl.endsWith("/v1") ? "/models" : "/v1/models";
+}
+
+function getOpenAIResponsesPath(target: CheckTarget) {
+  return target.baseUrl.endsWith("/v1") ? "/responses" : "/v1/responses";
+}
+
+function createCheckResult(target: CheckTarget, model: string, result: Omit<CheckResult, "targetId" | "targetName" | "providerType" | "model">): CheckResult {
+  return {
+    targetId: target.id,
+    targetName: target.name,
+    providerType: target.providerType,
+    model,
+    ...result,
+  };
+}
+
+async function checkOpenAICompatibleOnce(target: CheckTarget, model: string): Promise<CheckResult> {
   const startedAt = Date.now();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), target.timeoutMs ?? DEFAULT_TIMEOUT_MS);
 
   try {
-    const response = await fetch(`${target.baseUrl}/chat/completions`, {
+    const response = await fetch(buildUrl(target.baseUrl, "/chat/completions"), {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${target.apiKey || ""}`,
-      },
+      headers: createOpenAIHeaders(target.apiKey),
       body: JSON.stringify({
-        model: target.model,
+        model,
         messages: [{ role: "user", content: target.checkPrompt || DEFAULT_CHECK_PROMPT }],
         max_tokens: 1,
         temperature: 0,
@@ -369,10 +431,7 @@ async function checkOpenAICompatibleOnce(target: CheckTarget): Promise<CheckResu
     const latencyMs = Date.now() - startedAt;
 
     if (!response.ok) {
-      return {
-        targetId: target.id,
-        targetName: target.name,
-        providerType: target.providerType,
+      return createCheckResult(target, model, {
         success: false,
         status: classifyStatus(response.status),
         latencyMs,
@@ -380,14 +439,11 @@ async function checkOpenAICompatibleOnce(target: CheckTarget): Promise<CheckResu
         message: await parseErrorMessage(response),
         checkedAt: new Date().toISOString(),
         retries: 0,
-      };
+      });
     }
 
     const degradedThreshold = target.degradedThresholdMs ?? DEFAULT_DEGRADED_THRESHOLD_MS;
-    return {
-      targetId: target.id,
-      targetName: target.name,
-      providerType: target.providerType,
+    return createCheckResult(target, model, {
       success: true,
       status: latencyMs > degradedThreshold ? "degraded" : "healthy",
       latencyMs,
@@ -395,13 +451,10 @@ async function checkOpenAICompatibleOnce(target: CheckTarget): Promise<CheckResu
       message: "检测成功",
       checkedAt: new Date().toISOString(),
       retries: 0,
-    };
+    });
   } catch (error) {
     const timedOut = error instanceof Error && error.name === "AbortError";
-    return {
-      targetId: target.id,
-      targetName: target.name,
-      providerType: target.providerType,
+    return createCheckResult(target, model, {
       success: false,
       status: classifyStatus(null, timedOut),
       latencyMs: Date.now() - startedAt,
@@ -409,13 +462,81 @@ async function checkOpenAICompatibleOnce(target: CheckTarget): Promise<CheckResu
       message: timedOut ? "请求超时" : sanitizeMessage(error instanceof Error ? error.message : "请求失败"),
       checkedAt: new Date().toISOString(),
       retries: 0,
-    };
+    });
   } finally {
     clearTimeout(timeout);
   }
 }
 
-async function checkAnthropicCompatibleOnce(target: CheckTarget): Promise<CheckResult> {
+async function checkOpenAIResponsesOnce(target: CheckTarget, model: string): Promise<CheckResult> {
+  const startedAt = Date.now();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), target.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(buildUrl(target.baseUrl, getOpenAIResponsesPath(target)), {
+      method: "POST",
+      headers: createOpenAIHeaders(target.apiKey),
+      body: JSON.stringify({
+        model,
+        input: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text: target.checkPrompt || DEFAULT_CHECK_PROMPT,
+              },
+            ],
+          },
+        ],
+        max_output_tokens: 1,
+      }),
+      signal: controller.signal,
+      cache: "no-store",
+    });
+
+    const latencyMs = Date.now() - startedAt;
+
+    if (!response.ok) {
+      return createCheckResult(target, model, {
+        success: false,
+        status: classifyStatus(response.status),
+        latencyMs,
+        statusCode: response.status,
+        message: await parseErrorMessage(response),
+        checkedAt: new Date().toISOString(),
+        retries: 0,
+      });
+    }
+
+    const degradedThreshold = target.degradedThresholdMs ?? DEFAULT_DEGRADED_THRESHOLD_MS;
+    return createCheckResult(target, model, {
+      success: true,
+      status: latencyMs > degradedThreshold ? "degraded" : "healthy",
+      latencyMs,
+      statusCode: response.status,
+      message: "检测成功",
+      checkedAt: new Date().toISOString(),
+      retries: 0,
+    });
+  } catch (error) {
+    const timedOut = error instanceof Error && error.name === "AbortError";
+    return createCheckResult(target, model, {
+      success: false,
+      status: classifyStatus(null, timedOut),
+      latencyMs: Date.now() - startedAt,
+      statusCode: null,
+      message: timedOut ? "请求超时" : sanitizeMessage(error instanceof Error ? error.message : "请求失败"),
+      checkedAt: new Date().toISOString(),
+      retries: 0,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function checkAnthropicCompatibleOnce(target: CheckTarget, model: string): Promise<CheckResult> {
   const startedAt = Date.now();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), target.timeoutMs ?? DEFAULT_TIMEOUT_MS);
@@ -429,7 +550,7 @@ async function checkAnthropicCompatibleOnce(target: CheckTarget): Promise<CheckR
         "anthropic-version": ANTHROPIC_VERSION,
       },
       body: JSON.stringify({
-        model: target.model,
+        model,
         max_tokens: 1,
         temperature: 0,
         messages: [{ role: "user", content: target.checkPrompt || DEFAULT_CHECK_PROMPT }],
@@ -441,10 +562,7 @@ async function checkAnthropicCompatibleOnce(target: CheckTarget): Promise<CheckR
     const latencyMs = Date.now() - startedAt;
 
     if (!response.ok) {
-      return {
-        targetId: target.id,
-        targetName: target.name,
-        providerType: target.providerType,
+      return createCheckResult(target, model, {
         success: false,
         status: classifyStatus(response.status),
         latencyMs,
@@ -452,14 +570,11 @@ async function checkAnthropicCompatibleOnce(target: CheckTarget): Promise<CheckR
         message: await parseErrorMessage(response),
         checkedAt: new Date().toISOString(),
         retries: 0,
-      };
+      });
     }
 
     const degradedThreshold = target.degradedThresholdMs ?? DEFAULT_DEGRADED_THRESHOLD_MS;
-    return {
-      targetId: target.id,
-      targetName: target.name,
-      providerType: target.providerType,
+    return createCheckResult(target, model, {
       success: true,
       status: latencyMs > degradedThreshold ? "degraded" : "healthy",
       latencyMs,
@@ -467,6 +582,113 @@ async function checkAnthropicCompatibleOnce(target: CheckTarget): Promise<CheckR
       message: "检测成功",
       checkedAt: new Date().toISOString(),
       retries: 0,
+    });
+  } catch (error) {
+    const timedOut = error instanceof Error && error.name === "AbortError";
+    return createCheckResult(target, model, {
+      success: false,
+      status: classifyStatus(null, timedOut),
+      latencyMs: Date.now() - startedAt,
+      statusCode: null,
+      message: timedOut ? "请求超时" : sanitizeMessage(error instanceof Error ? error.message : "请求失败"),
+      checkedAt: new Date().toISOString(),
+      retries: 0,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function checkModelWithRetry(target: CheckTarget, model: string): Promise<CheckResult> {
+  const maxRetries = target.maxRetries ?? DEFAULT_MAX_RETRIES;
+  let lastResult: CheckResult | null = null;
+  let totalRetries = 0;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const result =
+      target.providerType === "openai-compatible"
+        ? await checkOpenAICompatibleOnce(target, model)
+        : target.providerType === "openai-responses"
+          ? await checkOpenAIResponsesOnce(target, model)
+          : await checkAnthropicCompatibleOnce(target, model);
+
+    lastResult = result;
+
+    if (result.success || !shouldRetry(result.statusCode, result.status === "timeout")) {
+      return { ...result, retries: totalRetries };
+    }
+
+    if (attempt < maxRetries) {
+      totalRetries++;
+      await new Promise((resolve) => setTimeout(resolve, getRetryDelay(attempt)));
+    }
+  }
+
+  return { ...lastResult!, retries: totalRetries };
+}
+
+function extractModelIds(payload: unknown): string[] {
+  if (!payload || typeof payload !== "object") {
+    return [];
+  }
+
+  const data = (payload as { data?: Array<{ id?: string }> }).data;
+  if (!Array.isArray(data)) {
+    return [];
+  }
+
+  return [...new Set(data.map((item) => item?.id?.trim()).filter((item): item is string => Boolean(item)))];
+}
+
+async function fetchAvailableModelsOnce(target: CheckTarget): Promise<AvailableModelsResult> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), target.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+
+  try {
+    const headers: Record<string, string> =
+      target.providerType === "anthropic-compatible"
+        ? {
+            "Content-Type": "application/json",
+            "x-api-key": target.apiKey || "",
+            "anthropic-version": ANTHROPIC_VERSION,
+          }
+        : createOpenAIHeaders(target.apiKey);
+
+    const modelsPath = target.providerType === "anthropic-compatible" ? "/v1/models" : getOpenAIModelsPath(target);
+    const response = await fetch(buildUrl(target.baseUrl, modelsPath), {
+      method: "GET",
+      headers,
+      signal: controller.signal,
+      cache: "no-store",
+    });
+
+    if (!response.ok) {
+      return {
+        targetId: target.id,
+        targetName: target.name,
+        providerType: target.providerType,
+        success: false,
+        status: classifyStatus(response.status),
+        statusCode: response.status,
+        message: await parseErrorMessage(response),
+        checkedAt: new Date().toISOString(),
+        models: [],
+      };
+    }
+
+    const payload = (await response.json()) as unknown;
+    const models = extractModelIds(payload);
+
+    return {
+      targetId: target.id,
+      targetName: target.name,
+      providerType: target.providerType,
+      success: true,
+      status: "healthy",
+      statusCode: response.status,
+      message: models.length > 0 ? `已获取 ${models.length} 个可用模型` : "上游未返回模型列表",
+      checkedAt: new Date().toISOString(),
+      models,
     };
   } catch (error) {
     const timedOut = error instanceof Error && error.name === "AbortError";
@@ -476,80 +698,33 @@ async function checkAnthropicCompatibleOnce(target: CheckTarget): Promise<CheckR
       providerType: target.providerType,
       success: false,
       status: classifyStatus(null, timedOut),
-      latencyMs: Date.now() - startedAt,
       statusCode: null,
       message: timedOut ? "请求超时" : sanitizeMessage(error instanceof Error ? error.message : "请求失败"),
       checkedAt: new Date().toISOString(),
-      retries: 0,
+      models: [],
     };
   } finally {
     clearTimeout(timeout);
   }
 }
 
-async function checkOpenAICompatible(target: CheckTarget): Promise<CheckResult> {
-  const maxRetries = target.maxRetries ?? DEFAULT_MAX_RETRIES;
-  let lastResult: CheckResult | null = null;
-  let totalRetries = 0;
-
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const result = await checkOpenAICompatibleOnce(target);
-    lastResult = result;
-
-    // 成功或不需要重试的错误，直接返回
-    if (result.success || !shouldRetry(result.statusCode, result.status === "timeout")) {
-      return { ...result, retries: totalRetries };
-    }
-
-    // 还有重试次数，等待后重试
-    if (attempt < maxRetries) {
-      totalRetries++;
-      const delay = getRetryDelay(attempt);
-      await new Promise((resolve) => setTimeout(resolve, delay));
-    }
-  }
-
-  // 重试耗尽，返回最后一次结果
-  return { ...lastResult!, retries: totalRetries };
-}
-
-async function checkAnthropicCompatible(target: CheckTarget): Promise<CheckResult> {
-  const maxRetries = target.maxRetries ?? DEFAULT_MAX_RETRIES;
-  let lastResult: CheckResult | null = null;
-  let totalRetries = 0;
-
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const result = await checkAnthropicCompatibleOnce(target);
-    lastResult = result;
-
-    // 成功或不需要重试的错误，直接返回
-    if (result.success || !shouldRetry(result.statusCode, result.status === "timeout")) {
-      return { ...result, retries: totalRetries };
-    }
-
-    // 还有重试次数，等待后重试
-    if (attempt < maxRetries) {
-      totalRetries++;
-      const delay = getRetryDelay(attempt);
-      await new Promise((resolve) => setTimeout(resolve, delay));
-    }
-  }
-
-  // 重试耗尽，返回最后一次结果
-  return { ...lastResult!, retries: totalRetries };
-}
-
 export async function checkTarget(target: CheckTarget) {
-  if (target.providerType === "openai-compatible") {
-    return checkOpenAICompatible(target);
-  }
-
-  return checkAnthropicCompatible(target);
+  return Promise.all(target.models.map((model) => checkModelWithRetry(target, model)));
 }
 
 export async function checkAllTargets() {
   const targets = getTargets();
-  return Promise.all(targets.map((target) => checkTarget(target)));
+  const resultGroups = await Promise.all(targets.map((target) => checkTarget(target)));
+  return resultGroups.flat();
+}
+
+export async function getAvailableModelsForTarget(target: CheckTarget) {
+  return fetchAvailableModelsOnce(target);
+}
+
+export async function getAvailableModelsForAllTargets() {
+  const targets = getTargets();
+  return Promise.all(targets.map((target) => getAvailableModelsForTarget(target)));
 }
 
 export function findTargetById(targetId: string) {
